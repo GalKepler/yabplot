@@ -49,7 +49,7 @@ def _build_contour_layers(contours, lh_v, lh_f, rh_v, rh_f,
     The lines are drawn as thin tubes (``line_width`` is their diameter in mm), so
     they look the same in every display mode and figure size.
     """
-    _BASE = {'color': 'black', 'line_width': 0.5, 'opacity': 1.0, 'include_nan': True,
+    _BASE = {'color': 'black', 'line_width': 1.0, 'opacity': 1.0, 'include_nan': True,
              'lighting': False}
 
     # a single region name
@@ -308,9 +308,9 @@ def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_k
     contours : bool, dict, list, str, or numpy.ndarray, optional
         Draw boundary lines between atlas regions. Default ``False``. Four forms:
 
-        - ``True``: all regions, default style (black, 0.5 mm wide, opaque).
+        - ``True``: all regions, default style (black, 1.5 mm wide, opaque).
         - **style dict** (values are primitives): all regions, custom style.
-          Keys: ``color``, ``line_width`` (width in mm on the surface, default ``0.5``),
+          Keys: ``color``, ``line_width`` (width in mm on the surface, default ``1.5``),
           ``opacity``, ``include_nan``.
           ``include_nan=False`` suppresses borders between two NaN regions while
           keeping outlines around regions that have data. Default ``True``.
