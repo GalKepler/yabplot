@@ -45,8 +45,16 @@ def _build_contour_layers(contours, lh_v, lh_f, rh_v, rh_f,
     - style-dict (values are primitives): all regions, custom style.
     - list / bool ndarray: those regions, default style.
     - region-dict (all values are dicts): per-region style for listed regions only.
+
+    The lines are drawn as thin tubes (``line_width`` is their diameter in mm), so
+    they look the same in every display mode and figure size.
     """
-    _BASE = {'color': 'black', 'line_width': 10.0, 'opacity': 1.0, 'include_nan': True}
+    _BASE = {'color': 'black', 'line_width': 0.5, 'opacity': 1.0, 'include_nan': True,
+             'lighting': False}
+
+    # a single region name
+    if isinstance(contours, str):
+        contours = [contours]
 
     # name → label-ID lookup (lut_names is a dense list indexed by label ID)
     name_to_id = {name: lid for lid, name in enumerate(lut_names)
@@ -56,9 +64,21 @@ def _build_contour_layers(contours, lh_v, lh_f, rh_v, rh_f,
         d = d.copy()
         return d.pop('include_nan', _BASE['include_nan']), d
 
+    def _names_to_ids(names):
+        unknown = [str(n) for n in names if n not in name_to_id]
+        if unknown:
+            warnings.warn(f"contours: ignoring region names that are not in the atlas: {unknown}")
+        return {name_to_id[n] for n in names if n in name_to_id}
+
     is_region_dict = (isinstance(contours, dict) and
                       bool(contours) and
                       all(isinstance(v, dict) for v in contours.values()))
+
+    if isinstance(contours, dict) and not is_region_dict and any(isinstance(v, dict) for v in contours.values()):
+        raise ValueError(
+            "contours dict must be either a style dict (e.g. {'color': 'white'}) or a dict "
+            "of region names mapped to style dicts, not a mix of both."
+        )
 
     if contours is True:
         inc_nan, pv_kw = _pop_include_nan(_BASE.copy())
@@ -72,6 +92,7 @@ def _build_contour_layers(contours, lh_v, lh_f, rh_v, rh_f,
         from collections import defaultdict
         base_inc_nan, base_pv = _pop_include_nan(_BASE.copy())
         kwargs_groups = defaultdict(list)
+        _names_to_ids(contours)  # warns about names that are not in the atlas
         for rname, rkwargs in contours.items():
             inc_nan, pv_kw = _pop_include_nan({**base_pv, 'include_nan': base_inc_nan, **rkwargs})
             key = (tuple(sorted(pv_kw.items())), inc_nan)
@@ -85,19 +106,29 @@ def _build_contour_layers(contours, lh_v, lh_f, rh_v, rh_f,
         inc_nan, pv_kw = _pop_include_nan(_BASE.copy())
         cr = np.asarray(contours)
         if cr.dtype == bool:
-            region_ids = {int(lut_ids[i]) for i, m in enumerate(cr) if m and i < len(lut_ids)}
+            if len(cr) != len(lut_ids):
+                raise ValueError(
+                    f"Contours mask length mismatch! The atlas LUT defines {len(lut_ids)} regions, "
+                    f"but the mask has {len(cr)}."
+                )
+            region_ids = {int(i) for i in lut_ids[cr]}
         else:
-            region_ids = {name_to_id[n] for n in cr if n in name_to_id}
+            region_ids = _names_to_ids(cr)
         groups = [(region_ids, inc_nan, pv_kw)]
 
     layers = []
     for region_ids_set, inc_nan, pv_kw in groups:
+        pv_kw = pv_kw.copy()
+        radius = pv_kw.pop('line_width') / 2
         lh_c = get_region_boundaries(lh_v, lh_f, tar_labels[:n_lh],
                                       values=lh_vals_raw, include_nan=inc_nan,
                                       region_ids=region_ids_set)
         rh_c = get_region_boundaries(rh_v, rh_f, tar_labels[n_lh:],
                                       values=rh_vals_raw, include_nan=inc_nan,
                                       region_ids=region_ids_set)
+        # thin tubes instead of pixel-wide lines, so the width scales with the brain
+        lh_c, rh_c = [c if c is None else c.strip().tube(radius=radius, n_sides=8)
+                      for c in (lh_c, rh_c)]
         if lh_c is not None or rh_c is not None:
             layers.append((lh_c, rh_c, pv_kw))
     return layers
@@ -274,15 +305,17 @@ def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_k
         'object': returns the raw pyvista plotter object.
     export_path : str, optional
         If provided, saves the final figure to this path (e.g., 'figure.png').
-    contours : bool, dict, list, or numpy.ndarray, optional
+    contours : bool, dict, list, str, or numpy.ndarray, optional
         Draw boundary lines between atlas regions. Default ``False``. Four forms:
 
-        - ``True``: all regions, default style (black, width 2, opaque).
+        - ``True``: all regions, default style (black, 0.5 mm wide, opaque).
         - **style dict** (values are primitives): all regions, custom style.
-          Keys: ``color``, ``line_width`` (default ``10.0``), ``opacity``, ``include_nan``.
+          Keys: ``color``, ``line_width`` (width in mm on the surface, default ``0.5``),
+          ``opacity``, ``include_nan``.
           ``include_nan=False`` suppresses borders between two NaN regions while
           keeping outlines around regions that have data. Default ``True``.
-        - **list** of region name strings or **bool ndarray** (len = LUT size):
+        - **list** of region name strings (or a single name) or **bool ndarray**
+          (one value per region, in the same order as array ``data``):
           those regions only, default style.
         - **region dict** (values are dicts): only the listed regions, each
           style dict merged with the global defaults. Same keys as style dict.
