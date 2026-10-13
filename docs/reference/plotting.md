@@ -12,10 +12,18 @@
     options:
         show_root_heading: true
 
+::: yabplot.plotting.plot_voxelwise
+    options:
+        show_root_heading: true
+
 ::: yabplot.plotting.plot_vertexwise
     options:
         show_root_heading: true
 
 ::: yabplot.plotting.plot_connectome
+    options:
+        show_root_heading: true
+
+::: yabplot.plotting.clear_cache
     options:
         show_root_heading: true

@@ -5,17 +5,18 @@ examples_/
 docs/tutorials/tutorial_data/
 dev/
 site/
-paper/
 tutorial_data/
 test.ipynb
 todo.md
 test_data/
-*.ipynb
+# *.ipynb
 test.py
+# paper/figures/
 
 .DS_Store
 __pycache__/
 .venv
+.pytest_cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

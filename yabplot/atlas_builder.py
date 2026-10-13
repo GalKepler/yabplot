@@ -11,6 +11,10 @@ from .plotting import plot_cortical, plot_subcortical
 
 ### CORTICAL
 
+def _to_int_labels(arr):
+    """helper to round then cast label/mask data to integer region IDs."""
+    return np.asarray(arr).round().astype(int).flatten()
+
 def _build_adjacency(surf_path, n_vert=32492):
     """internal helper to build surface adjacency matrix."""
     surf = nib.load(surf_path)
@@ -99,13 +103,13 @@ def build_cortical_atlas(nii_path, wb_txt_path, out_dir, include_list=None, excl
 
     # merge LH and RH, then apply masks
     data = np.concatenate([
-        nib.load(lh_gii).darrays[0].data.astype(int).flatten(),
-        nib.load(rh_gii).darrays[0].data.astype(int).flatten()
+        _to_int_labels(nib.load(lh_gii).darrays[0].data),
+        _to_int_labels(nib.load(rh_gii).darrays[0].data)
     ])
-    
+
     mask = np.concatenate([
-        nib.load(lh_mask_path).darrays[0].data.astype(int).flatten() != 0,
-        nib.load(rh_mask_path).darrays[0].data.astype(int).flatten() != 0
+        _to_int_labels(nib.load(lh_mask_path).darrays[0].data) != 0,
+        _to_int_labels(nib.load(rh_mask_path).darrays[0].data) != 0
     ])
 
     data[~mask] = 0
@@ -289,7 +293,7 @@ def build_subcortical_atlas(nii_path, labels_dict, out_dir, include_list=None, e
 
     # load the nifti volume and its affine matrix
     img = nib.load(nii_path)
-    data = img.get_fdata()
+    data = img.get_fdata().round()
     affine = img.affine
 
     # loop through targets, extract meshes, and save

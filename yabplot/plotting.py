@@ -1,12 +1,16 @@
 import os
 import gc
 import re
+import random
+import warnings
 import numpy as np
 import pandas as pd
 import nibabel as nib
 import pyvista as pv
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, to_rgba
+from matplotlib.pyplot import get_cmap
+from scipy.ndimage import gaussian_filter
 
 from .data import (
     get_surface_paths, _resolve_resource_path, _find_cortical_files,
@@ -196,12 +200,26 @@ def _render_cortical_views(lh_v, lh_f, lh_vals, rh_v, rh_f, rh_vals, is_cat,
     return finalize_plot(plotter, export_path, display_type, ax=ax, cbar_info=cbar_info, cbar_kwargs=cbar_kwargs)
 
 
+def get_base_name(name):
+    """Strip one hemisphere suffix or prefix to get the base region name."""
+    n = name.lower()
+    for suffix in ['_l', '_r', '-lh', '-rh']:
+        if n.endswith(suffix):
+            return name[:len(name)-len(suffix)]
+    for prefix in ['l-', 'r-', 'l_', 'r_']:
+        if n.startswith(prefix):
+            return name[len(prefix):]
+    for word in ['left_', 'right_', 'left-', 'right-']:
+        if n.startswith(word):
+            return name[len(word):]
+    return name
+
 
 ### PLOT FOR ATLAS-BASED CORTICAL DATA ###
 
 def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_kwargs=None, views=None, layout=None,
                   bmesh='midthickness', figsize=None, cmap='coolwarm', vminmax=[None, None],
-                  nan_color=(1.0, 1.0, 1.0), style='default', zoom=1.2, proc_vertices=None,
+                  nan_color=(1.0, 1.0, 1.0), style='default', zoom=1.2, proc_vertices='sharp',
                   display_type='matplotlib', export_path=None, contours=False):
     """
     Visualize data on the cortical surface using a specified atlas.
@@ -246,9 +264,9 @@ def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_k
         Camera zoom level. >1.0 zooms in, <1.0 zooms out. Default is 1.2.
     proc_vertices : str or None, optional
         Whether to process the vertices edges according to geometry of bmesh.
-        Set to None to not perform (default).
-        'blur': Applies simple blurring between different color vertices (low performance impact).
-        'sharp': Applies sharpening of the resolution of different color vertices (high performance impact).
+        Set to None to not perform.
+        'blur': Applies simple blurring between different color vertices.
+        'sharp': Applies sharpening of the resolution of different color vertices (default).
     display_type : {'matplotlib', 'interactive', 'pyvista', 'object'}, optional
         'matplotlib': returns a matplotlib figure and axis (default).
         'interactive': opens an interactive trame viewer in the browser.
@@ -326,9 +344,8 @@ def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_k
 ### PLOT FOR VERTEX-WISE CORTICAL DATA ###
 
 def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=None, layout=None, figsize=None,
-                    cmap='coolwarm', vminmax=[None, None],
-                    nan_color=(1.0, 1.0, 1.0), style='default', zoom=1.2,
-                    proc_vertices=None, display_type='matplotlib', export_path=None):
+                    cmap='coolwarm', vminmax=[None, None], nan_color=(1.0, 1.0, 1.0), style='default', zoom=1.2,
+                    display_type='matplotlib', export_path=None, lut=None, proc_vertices='sharp'):
     """
     Visualize arbitrary per-vertex scalar data on a user-supplied brain mesh.
 
@@ -362,8 +379,6 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
         Lighting preset ('default', 'matte', 'glossy', 'sculpted', 'flat').
     zoom : float, optional
         Camera zoom level. Default is 1.2.
-    proc_vertices : str or None, optional
-        Vertex processing mode: None, 'blur', or 'sharp'.
     display_type : {'matplotlib', 'interactive', 'pyvista', 'object'}, optional
         'matplotlib': returns a matplotlib figure and axis (default).
         'interactive': opens an interactive trame viewer in the browser.
@@ -371,6 +386,17 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
         'object': returns the raw pyvista plotter object.
     export_path : str, optional
         If provided, saves the figure to this path.
+    lut : list, numpy.ndarray or 'auto', optional
+        Lookup table for categorical data (e.g., labels or clusters), where ``lut[i]``
+        is the color of label ``i``. Label 0 is treated as background and drawn with
+        `nan_color`, so ``lut[0]`` is not used. If 'auto', a distinct color is generated
+        for each label. When provided, `cmap` and `vminmax` are ignored and no colorbar
+        is drawn. Default is None (data is treated as continuous).
+    proc_vertices : str or None, optional
+        Whether to process the vertices edges between labels. Only used when `lut` is
+        provided (continuous data is always plotted as is).
+        Set to None to not perform.
+        'sharp': Applies sharpening of the resolution of different color vertices (default).
 
     Returns
     -------
@@ -399,6 +425,9 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
     >>> lh['thickness'] = lh_thick_array
     >>> rh['thickness'] = rh_thick_array
     >>> plot_vertexwise(lh, rh, scalars='thickness', cmap='inferno')
+    >>>
+    >>> # If your data are labels (e.g., clusters 1 and 2), color label i with lut[i]
+    >>> plot_vertexwise(lh, rh, scalars='clusters', lut=['white', 'red', 'blue'])
     """
 
     # extract v, f, raw from PyVista meshes
@@ -407,11 +436,34 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
     rh_v, rh_f = extract_polydata(rh)
     rh_vals_raw = rh[scalars]
 
+    # categorical mode is opt-in: label i is colored with lut[i]
+    is_cat = lut is not None
+    max_id = None
+    if is_cat:
+        # labels must be whole numbers (NaN is allowed and treated as background)
+        labels = np.concatenate([lh_vals_raw, rh_vals_raw])
+        labels = labels[~np.isnan(labels)]
+        if not np.all(labels == np.round(labels)):
+            raise ValueError("lut requires whole-number labels (e.g., 0, 1, 2) but data contains other values.")
+        max_label = int(labels.max()) if labels.size else 0
+        if isinstance(lut, str) and lut == 'auto':
+            lut = generate_distinct_colors(max_label + 1, seed=42)
+        if max_label >= len(lut):
+            raise ValueError(f"lut has {len(lut)} colors but data contains label {max_label}.")
+        # color range must span the whole lut (not the data) to keep label i on lut[i]
+        max_id = len(lut) - 1
+        # 'blur' mixes neighbouring label ids, which would draw wrong labels on the edges
+        if proc_vertices not in ('sharp', None):
+            raise ValueError("proc_vertices must be 'sharp' or None.")
+    else:
+        # edge processing works per label, so continuous data is plotted as is
+        proc_vertices = None
+
     # render
     return _render_cortical_views(
-        lh_v, lh_f, lh_vals_raw, rh_v, rh_f, rh_vals_raw, False, ax, cbar_kwargs,
+        lh_v, lh_f, lh_vals_raw, rh_v, rh_f, rh_vals_raw, is_cat, ax, cbar_kwargs,
         views, layout, figsize, cmap, vminmax, nan_color, style,
-        zoom, proc_vertices, display_type, export_path
+        zoom, proc_vertices, display_type, export_path, lut_colors=lut, max_id=max_id
     )
 
 
@@ -419,10 +471,12 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
 ### PLOT FOR ATLAS-BASED SUBCORTICAL DATA ###
 
 def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_kwargs=None, views=None, layout=None,
-                     figsize=None, cmap='coolwarm', vminmax=[None, None], nan_color='#cccccc',
+                     figsize=None, cmap=None, vminmax=[None, None], nan_color='#cccccc',
                      nan_alpha=1.0, style='default', bmesh='midthickness',
-                     bmesh_alpha=0.2, bmesh_color='lightgray', zoom=1.2, display_type='matplotlib',
-                     export_path=None, custom_atlas_proc=dict(smooth_i=15, smooth_f=0.6)):
+                     bmesh_alpha=0.15, bmesh_color='lightgray', zoom=1.2, display_type='matplotlib',
+                     export_path=None, custom_atlas_proc=dict(smooth_i=15, smooth_f=0.6),
+                     atlas_color_seed=42, plot_regions_separately=False,
+                     shared_hemisphere_colors=False):
     """
     Visualize data on the subcortical structures using a specified atlas.
 
@@ -449,7 +503,10 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
     figsize : tuple (width, height), optional
         Window size in inches. If None, automatically calculated based on the number of views and layout.
     cmap : str or matplotlib.colors.Colormap, optional
-        Colormap for continuous data. Ignored if `data` is None. Default is 'coolwarm'.
+        Colormap for continuous data. Defaults to 'coolwarm' when `data` is given.
+        If `data` is None (atlas mode), `cmap` is unused by default and regions get
+        randomly-seeded distinct colors; pass a colormap (name or object) to instead
+        sample region colors from that colormap's gradient.
     vminmax : list [min, max], optional
         Manual lower and upper bounds for the colormap. If [None, None],
         bounds are inferred from the data range.
@@ -464,7 +521,7 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         (e.g., 'midthickness', 'white', 'swm', etc), single PolyData (used for both hemispheres)
         or a dict with 'L'/'R' keys. Default is 'midthickness'.
     bmesh_alpha : float, optional
-        Opacity of the context brain mesh. Default is 0.2.
+        Opacity of the context brain mesh. Default is 0.15.
     bmesh_color : str, optional
         Color of the context brain mesh.
     zoom : float, optional
@@ -476,10 +533,39 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         'object': returns the raw pyvista plotter object.
     export_path : str, optional
         If provided, saves the final figure to this path (e.g., 'figure.png').
+        With `plot_regions_separately`, it is instead the directory that the
+        per-region PNGs are saved to.
     custom_atlas_proc : dict, optional
         Parameters for processing custom GIfTI files.
         Keys: 'smooth_i' (iterations) and 'smooth_f' (relaxation factor).
         Default is {'smooth_i': 15, 'smooth_f': 0.6}.
+    atlas_color_seed : int, optional
+        Seed controlling the categorical color arrangement in atlas (no-data) mode.
+        With the default palette it seeds the distinct-color generator; with a
+        colormap it seeds a shuffle so gradient-adjacent regions get contrasting
+        colors. Change it to get a different, reproducible arrangement. Ignored when
+        `data` is given. Default is 42.
+    plot_regions_separately : bool, optional
+        If True, renders each region + view combination on its own instead of a single
+        combined figure. If ``export_path`` is set, it is always treated as a directory
+        (created if missing): one transparent-background PNG per region + view is saved
+        there (named ``{region}_{view_face}.png``, useful for SVG tracing pipelines)
+        and None is returned. ``view_face`` is the view name without ``left_``/``right_``;
+        midline regions keep the full view name. Otherwise one matplotlib figure per
+        region + view is opened and the axes are returned as a list.
+        All renders share the same camera framing, so regions keep their relative
+        position and size, and the same size: `figsize` if given, else 3.5 x 3 inches.
+        `ax`, `layout`, `display_type` and `cbar_kwargs` are not used in this mode and
+        no colorbar is drawn. Default is False.
+    shared_hemisphere_colors : bool, optional
+        If True, bilateral region pairs (e.g. ``putamen_l`` / ``putamen_r``) are drawn
+        in the same color, so each structure reads as one color across both hemispheres.
+        Pairs are matched by name after removing one hemisphere tag (case-insensitive):
+        a ``_l``/``_r`` or ``-lh``/``-rh`` suffix, or a ``l-``/``r-``, ``l_``/``r_``,
+        ``left_``/``right_`` or ``left-``/``right-`` prefix. Regions named in any other
+        way keep their own color.
+        Only applies in atlas (no-data) mode; ignored when `data` is given. If False
+        (default), every region is assigned its own independent color.
 
     Returns
     -------
@@ -489,6 +575,8 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         - 'interactive': returns a trame browser viewer.
         - 'pyvista': returns a static jupyter widget.
         - 'object': returns the raw pyvista plotter.
+        with `plot_regions_separately`, returns None if `export_path` is set,
+        otherwise a list of matplotlib axes (one per region + view).
     """
 
     # defaults
@@ -516,27 +604,124 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
 
     # prepare colors and map data
     if data is not None:
+        cmap = cmap if cmap is not None else 'coolwarm'
         d_data = prep_data(data, rmesh_names, atlas, 'subcortical')
         valid_vals = [v for v in d_data.values() if pd.notna(v)]
         vmin = vminmax[0] if vminmax[0] is not None else (min(valid_vals) if valid_vals else 0)
         vmax = vminmax[1] if vminmax[1] is not None else (max(valid_vals) if valid_vals else 1)
         c_vlim = [vmin, vmax]
     else:
-        colors = generate_distinct_colors(len(rmesh_names), seed=42)
-        d_atlas_colors = {name: color for name, color in zip(rmesh_names, colors)}
+        # determine the key for each region: base name (hemisphere-shared) or the raw name
+        color_keys = (
+            list(dict.fromkeys(get_base_name(n) for n in rmesh_names))
+            if shared_hemisphere_colors
+            else list(dict.fromkeys(rmesh_names))
+        )
+
+        # generate one color per unique key
+        if cmap is None:
+            key_colors = generate_distinct_colors(len(color_keys), seed=atlas_color_seed)
+        else:
+            # get_cmap accepts either a colormap name (str) or a Colormap object
+            cmap_obj = get_cmap(cmap)
+            key_colors = [tuple(c[:3]) for c in cmap_obj(np.linspace(0, 1, len(color_keys)))]
+            random.Random(atlas_color_seed).shuffle(key_colors)
+        color_map = dict(zip(color_keys, key_colors))
+
+        lookup = get_base_name if shared_hemisphere_colors else (lambda n: n)
+        d_atlas_colors = {name: color_map[lookup(name)] for name in rmesh_names}
         c_vlim = [0, 1]
 
-    # setup plotter
+    # setup views and shading (shared by both code paths)
     sel_views = get_view_configs(views)
-    ax, display_type, figsize = prepare_plotter(ax, display_type, sel_views, layout, figsize)
-
-    needs_bottom = (data is not None)
-    plotter, ncols, nrows = setup_plotter(sel_views, layout, figsize, display_type,
-                                           needs_bottom_row=needs_bottom)
-
 
     # get shading parameters from style
     shading_params = get_shading_preset(style)
+
+    if plot_regions_separately:
+        # per-region output; export_path is always a directory here
+        do_export = export_path is not None
+        if do_export:
+            out_dir = export_path
+            os.makedirs(out_dir, exist_ok=True)
+
+        # every render has the same size. 'object' makes prepare_plotter only convert
+        # figsize to pixels, so no figure is created for the unused combined layout
+        _, _, region_size = prepare_plotter(None, 'object', sel_views, layout, figsize)
+        region_window_size = list(region_size) if region_size is not None else [700, 600]
+        region_axes = []
+
+        for view_name, cfg in sel_views.items():
+            print(f"Rendering view: {view_name}...")
+
+            for target_name in list(meshes.keys()):
+                is_left, is_right = _get_side_tokens(target_name)
+                if cfg['side'] == 'L' and is_right and not is_left:
+                    continue
+                if cfg['side'] == 'R' and is_left and not is_right:
+                    continue
+
+                if is_left != is_right:
+                    view_face = view_name.replace('left_', '').replace('right_', '')
+                else:
+                    view_face = view_name
+
+                indiv_plotter = pv.Plotter(off_screen=True, window_size=region_window_size)
+                indiv_plotter.set_background('white')
+                add_context_to_view(indiv_plotter, ctx_meshes, cfg['side'], bmesh_alpha,
+                                    bmesh_color, **shading_params)
+
+                region_actors = {}
+                for name, mesh in meshes.items():
+                    n_is_left, n_is_right = _get_side_tokens(name)
+                    if cfg['side'] == 'L' and n_is_right and not n_is_left:
+                        continue
+                    if cfg['side'] == 'R' and n_is_left and not n_is_right:
+                        continue
+
+                    props = shading_params.copy()
+                    if data is not None:
+                        val = d_data.get(name, np.nan) if pd.notna(d_data.get(name)) else np.nan
+                        has_val = not np.isnan(val)
+                        mesh['Data'] = np.full(mesh.n_points, val)
+                        props.update({
+                            'scalars': 'Data', 'cmap': cmap, 'clim': c_vlim,
+                            'nan_color': nan_color, 'opacity': 1.0 if has_val else nan_alpha,
+                            'show_scalar_bar': False,
+                        })
+                    else:
+                        props.update({'color': d_atlas_colors[name], 'opacity': 1.0})
+
+                    region_actors[name] = indiv_plotter.add_mesh(mesh, **props)
+
+                # frame the camera on all regions before hiding the non-targets, so each
+                # region keeps its true position and size (hidden actors are not framed)
+                set_camera(indiv_plotter, cfg, zoom=zoom)
+                for name, actor in region_actors.items():
+                    actor.SetVisibility(name == target_name)
+                indiv_plotter.hide_axes()
+
+                if do_export:
+                    out_file = os.path.join(out_dir, f'{target_name}_{view_face}.png')
+                    indiv_plotter.screenshot(out_file, transparent_background=True)
+                    indiv_plotter.close()
+                    print(f"  Saved → {out_file}")
+                else:
+                    img = indiv_plotter.screenshot(transparent_background=True, return_img=True)
+                    indiv_plotter.close()
+                    _, region_ax = plt.subplots()
+                    region_ax.imshow(img)
+                    region_ax.set_title(f'{target_name} ({view_name})', fontsize=8)
+                    region_ax.axis('off')
+                    region_axes.append(region_ax)
+
+        return None if do_export else region_axes
+
+    # setup plotter (combined / normal path)
+    ax, display_type, figsize = prepare_plotter(ax, display_type, sel_views, layout, figsize)
+    needs_bottom = (data is not None)
+    plotter, ncols, nrows = setup_plotter(sel_views, layout, figsize, display_type,
+                                          needs_bottom_row=needs_bottom)
     scalar_bar_mapper = None
 
     # pre-calculate side tokens for all meshes to avoid regex in loops
@@ -658,7 +843,7 @@ def _retrieve_static_mesh(category, atlas_key, name, fpath, **kwargs):
 def plot_tracts(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_kwargs=None, views=None, layout=None,
                 figsize=None, cmap='coolwarm', alpha=1.0, vminmax=[None, None],
                 nan_color='#BDBDBD', nan_alpha=1.0, style='default',
-                bmesh='midthickness', bmesh_alpha=0.2, bmesh_color='lightgray',
+                bmesh='midthickness', bmesh_alpha=0.15, bmesh_color='lightgray',
                 zoom=1.2, orientation_coloring=False, display_type='matplotlib',
                 tract_kwargs=dict(render_lines_as_tubes=True, line_width=1.2),
                 export_path=None):
@@ -706,7 +891,7 @@ def plot_tracts(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_kwa
         (e.g., 'midthickness', 'white', 'swm', etc), single PolyData (used for both hemispheres)
         or a dict with 'L'/'R' keys. Default is 'midthickness'.
     bmesh_alpha : float, optional
-        Opacity of the context brain mesh. Default is 0.2.
+        Opacity of the context brain mesh. Default is 0.15.
     bmesh_color : str, optional
         Color of the context brain mesh.
     zoom : float, optional
@@ -1084,7 +1269,7 @@ def plot_connectome(matrix=None, atlas=None, custom_atlas_path=None, ax=None, cb
                     node_vminmax=[None, None], edge_threshold='95%', edge_thickness='weight',
                     edge_scaling=1.0, edge_cmap='coolwarm', edge_color=None, edge_alpha=1.0,
                     edge_vminmax=[None, None], edge_curve=0.1, directed=False,
-                    style='default', bmesh_type='midthickness', bmesh_alpha=0.2,
+                    style='default', bmesh_type='midthickness', bmesh_alpha=0.15,
                     bmesh_color='lightgray', zoom=1.2, display_type='matplotlib', export_path=None):
     """
     visualizes an n x n connectivity matrix as a 3d network in the brain.
@@ -1143,7 +1328,7 @@ def plot_connectome(matrix=None, atlas=None, custom_atlas_path=None, ax=None, cb
     bmesh_type : str, optional
         surface to render as context (e.g., 'midthickness'). default is 'midthickness'.
     bmesh_alpha : float, optional
-        opacity of the context brain hull. default is 0.2.
+        Opacity of the context brain mesh. Default is 0.15.
     bmesh_color : str, optional
         color of the context brain hull. default is 'lightgray'.
     zoom : float, optional
@@ -1336,3 +1521,225 @@ def plot_connectome(matrix=None, atlas=None, custom_atlas_path=None, ax=None, cb
                 cbar_info.append({'cmap': node_cmap, 'vminmax': [n_vmin, n_vmax], 'title': node_title})
 
     return finalize_plot(plotter, export_path=export_path, display_type=display_type, ax=ax, cbar_info=cbar_info, cbar_kwargs=cbar_kwargs)
+
+
+### PLOT FOR VOXEL-WISE DATA ###
+
+def plot_voxelwise(nii_path, threshold='95%', n_levels=20, ax=None, cbar_kwargs=None, 
+                   views=None, layout=None, figsize=None, cmap='coolwarm', 
+                   vminmax=[None, None], blur_sigma=0.0, smooth_i=0, smooth_f=0.0,
+                   style='default', bmesh='midthickness', bmesh_alpha=0.15, 
+                   bmesh_color='lightgray', ignore_bmesh=True, zoom=1.2, 
+                   display_type='matplotlib', export_path=None):
+    """
+    Visualize 3D voxelwise data from a NIfTI file by extracting it as surface meshes.
+
+    This function extracts topographical shells (isosurfaces) from a volumetric image
+    and renders them within a transparent brain mesh and makes the high-intensity
+    layers with higher priority and more visible.
+
+    Parameters
+    ----------
+    nii_path : str
+        Path to the NIfTI file to visualize.
+    threshold : float or str, optional
+        Value below which voxels are hidden. Can be a float or a percentage
+        string like '95%'. Default is '95%'.
+    n_levels : int, optional
+        Number of nested isosurfaces to generate. Higher values show more detail
+        of the internal intensity gradient. Default is 20.
+    ax : matplotlib.axes.Axes, optional
+        Matplotlib axis to render into if display_type is 'matplotlib'.
+    cbar_kwargs : dict, optional
+        Arguments passed to the colorbar.
+    views : list of str, optional
+        Views to display (e.g. 'left_lateral', 'superior'). Defaults to all views.
+    layout : tuple (rows, cols), optional
+        Grid layout for subplots. If None, auto-calculated.
+    figsize : tuple (width, height), optional
+        Window size in inches.
+    cmap : str or matplotlib.colors.Colormap, optional
+        Colormap for the continuous voxel data.
+    vminmax : list [min, max], optional
+        Colormap bounds. If [None, None], uses robust 1st/99th percentiles.
+    blur_sigma : float, optional
+        Gaussian blur (voxel units) applied before thresholding for smoother geometry.
+    smooth_i : int, optional
+        Number of Laplacian smoothing iterations for the extracted mesh.
+    smooth_f : float, optional
+        Relaxation factor for mesh smoothing.
+    style : str, optional
+        Lighting preset ('default', 'matte', 'glossy', 'sculpted', 'flat').
+    bmesh : str, dict, or pyvista.PolyData, optional
+        Background context brain mesh (e.g. 'midthickness', 'pial').
+    bmesh_alpha : float, optional
+        Opacity of the context brain mesh. Default is 0.15.
+    bmesh_color : str, optional
+        Color of the context brain mesh.
+    ignore_bmesh : bool, optional
+        If True (default), data renders on top of brain regardless of depth (X-ray).
+        If False, brain surface correctly obscures the internal data.
+    zoom : float, optional
+        Camera zoom level. Default is 1.2.
+    display_type : {'matplotlib', 'interactive', 'pyvista', 'object'}, optional
+        Rendering backend and return type. Default is 'matplotlib'.
+    export_path : str, optional
+        If provided, saves the final figure to this path.
+
+    Returns
+    -------
+    matplotlib.axes.Axes or pyvista.Plotter or IPython.display.DisplayObject
+        returns based on display_type:
+        - 'matplotlib': returns a matplotlib axes object.
+        - 'interactive': returns a trame browser viewer.
+        - 'pyvista': returns a static jupyter widget.
+        - 'object': returns the raw pyvista plotter object.
+    """
+
+    # load and validate data
+    img = nib.load(nii_path)
+    data = img.get_fdata()
+
+    if data.ndim > 3:
+        warnings.warn(f"[WARNING] detected {data.ndim}d nifti volume. using the first volume (index 0).")
+        data = data[..., 0]
+
+    data = np.nan_to_num(data, nan=0.0)
+
+    # resolve threshold
+    if isinstance(threshold, str) and threshold.endswith('%'):
+        perc = float(threshold.strip('%'))
+        valid_vals = np.abs(data[data != 0.0])
+        actual_threshold = np.percentile(valid_vals, perc) if valid_vals.size > 0 else 1e-6
+    else:
+        actual_threshold = float(threshold) if threshold is not None else 1e-6
+
+    # resolve color limits
+    valid_original_mask = (np.abs(data) >= actual_threshold)
+    if np.any(valid_original_mask):
+        surviving = data[valid_original_mask]
+        has_negative = np.any(surviving < -actual_threshold)
+
+        if has_negative:
+            limit = max(np.percentile(np.abs(surviving), 99), actual_threshold * 1.1)
+            vmin_auto, vmax_auto = -limit, limit
+        else:
+            vmin_auto = np.percentile(surviving, 1)
+            vmax_auto = np.percentile(surviving, 99)
+
+        if vmin_auto == vmax_auto:
+            vmin_auto, vmax_auto = np.min(surviving), np.max(surviving)
+    else:
+        raise ValueError(f"No voxels found above threshold {actual_threshold}.")
+
+    vmin = vminmax[0] if vminmax[0] is not None else vmin_auto
+    vmax = vminmax[1] if vminmax[1] is not None else vmax_auto
+
+    # mesh extraction via nested isosurfaces
+    data_to_contour = gaussian_filter(data, sigma=float(blur_sigma)) if blur_sigma > 0 else data
+    grid = pv.ImageData()
+    grid.dimensions = data.shape
+    grid.point_data['Data'] = data_to_contour.flatten(order='F')
+
+    # generate levels for both positive and negative (if applicable)
+    pos_levels = np.linspace(actual_threshold, vmax, int(n_levels)) if vmax > actual_threshold else []
+    neg_levels = np.linspace(-actual_threshold, vmin, int(n_levels)) if vmin < -actual_threshold else []
+    shell_meshes = [] # List of (mesh, level_value)
+    for val in pos_levels:
+        mesh = grid.contour(isosurfaces=[val], scalars='Data')
+        if mesh.n_points > 0:
+            mesh.transform(img.affine, inplace=True)
+            if smooth_i and smooth_i > 0:
+                mesh = mesh.smooth(n_iter=int(smooth_i), relaxation_factor=float(smooth_f))
+            shell_meshes.append((mesh, val))
+    for val in neg_levels:
+        mesh = grid.contour(isosurfaces=[val], scalars='Data')
+        if mesh.n_points > 0:
+            mesh.transform(img.affine, inplace=True)
+            if smooth_i and smooth_i > 0:
+                mesh = mesh.smooth(n_iter=int(smooth_i), relaxation_factor=float(smooth_f))
+            shell_meshes.append((mesh, val))
+
+    if not shell_meshes:
+        raise ValueError("Extracted mesh has no vertices. Adjust threshold or blur_sigma.")
+
+    # plotter setup
+    sel_views = get_view_configs(views)
+    ax, display_type, figsize = prepare_plotter(ax, display_type, sel_views, layout, figsize)
+
+    plotter, ncols, nrows = setup_plotter(sel_views, layout, figsize, display_type, needs_bottom_row=True)
+    plotter.enable_depth_peeling(number_of_peels=20)
+    plotter.enable_anti_aliasing('msaa')
+    shading_params = get_shading_preset(style)
+    scalar_bar_mapper = None
+
+    # load context brain mesh
+    ctx_meshes = load_bmesh(bmesh)
+
+    # rendering loop
+    for i, (view_name, cfg) in enumerate(sel_views.items()):
+        plotter.subplot(i // ncols, i % ncols)
+
+        # base depth offset: push entire voxel group relative to brain
+        voxel_group_base = -20000.0 if ignore_bmesh else 20000.0
+
+        # helper to add shells from low to peak intensity
+        # adding cores last ensures peak visibility in painter's algorithm
+        def add_voxel_data():
+            nonlocal scalar_bar_mapper
+            sorted_shells = sorted(shell_meshes, key=lambda x: abs(x[1]))
+            for s_idx, (mesh, val) in enumerate(sorted_shells):
+                # hemisphere filtering
+                m_plot = mesh
+                if cfg['side'] == 'L':
+                    m_plot = mesh.clip(normal='x', origin=(0,0,0), invert=True)
+                elif cfg['side'] == 'R':
+                    m_plot = mesh.clip(normal='x', origin=(0,0,0), invert=False)
+
+                if m_plot.n_points == 0: continue
+
+                actor = plotter.add_mesh(
+                    m_plot, scalars='Data', cmap=cmap, clim=(vmin, vmax),
+                    opacity=1.0, show_scalar_bar=False, smooth_shading=True,
+                    lighting=False, name=f"voxels_{i}_{s_idx}"
+                )
+
+                # higher priority = closer to the camera, so peak cores are always on top
+                local_priority = voxel_group_base - (100.0 * (s_idx + 1))
+                actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                actor.mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(local_priority, local_priority)
+
+                if scalar_bar_mapper is None:
+                    scalar_bar_mapper = actor.mapper
+
+        def add_brain():
+            if not ctx_meshes: return
+            for h, mesh in ctx_meshes.items():
+                if (cfg['side'] == 'L' and h == 'R') or (cfg['side'] == 'R' and h == 'L'): continue
+                actor = plotter.add_mesh(mesh, color=bmesh_color, opacity=bmesh_alpha,
+                                         smooth_shading=True, show_edges=False,
+                                         name=f"bmesh_{h}_{i}", **shading_params)
+                actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                actor.mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0.0, 0.0)
+
+        # relative addition order
+        if ignore_bmesh:
+            add_brain()
+            add_voxel_data()
+        else:
+            add_voxel_data()
+            add_brain()
+
+        set_camera(plotter, cfg, zoom=zoom)
+        plotter.hide_axes()
+
+    # colorbar setup
+    cbar_title = "voxel values"
+    cbar_info = []
+    if scalar_bar_mapper:
+        if display_type != 'matplotlib':
+            add_colorbars(plotter, [scalar_bar_mapper], [cbar_title], nrows, figsize)
+        else:
+            cbar_info.append({'cmap': cmap, 'vminmax': [vmin, vmax], 'title': cbar_title})
+
+    return finalize_plot(plotter, export_path, display_type, ax=ax, cbar_info=cbar_info, cbar_kwargs=cbar_kwargs)

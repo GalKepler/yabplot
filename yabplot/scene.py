@@ -81,6 +81,15 @@ def prepare_plotter(ax, display_type, sel_views, layout, figsize):
     """
     import matplotlib.pyplot as plt
 
+    # reject unknown display types with a clear message
+    valid_types = ['matplotlib', 'interactive', 'pyvista', 'object']
+    if display_type not in valid_types:
+        raise ValueError(
+            f"invalid display_type {display_type!r}. supported options are: "
+            f"{', '.join(repr(t) for t in valid_types)}. "
+            f"for the older 'static' or 'none' behavior, use 'pyvista'."
+        )
+
     # handle legacy pixel values (safety check)
     if figsize is not None:
         if figsize[0] > 100 or figsize[1] > 100:
@@ -169,7 +178,7 @@ def setup_plotter(sel_views, layout, figsize, display_type, needs_bottom_row=Tru
 
     # ensure high quality by forcing off-screen for non-interactive modes
     plotter = pv.Plotter(shape=(nrows, ncols), groups=groups, row_weights=row_weights,
-                         off_screen=(display_type in ['object', 'static', 'matplotlib', 'pyvista']),
+                         off_screen=(display_type != 'interactive'),
                          window_size=actual_size, border=False)
     plotter.set_background('white')
     return plotter, ncols, nrows
@@ -312,7 +321,14 @@ def finalize_plot(plotter, export_path, display_type, ax=None, cbar_info=None, c
     elif display_type == 'interactive':
         # saving here captures only the 3d scene
         if export_path:
-            plotter.screenshot(export_path, transparent_background=True, scale=5)
+            # outside jupyter the window is not open yet, so there is nothing to capture
+            if plotter.off_screen:
+                plotter.screenshot(export_path, transparent_background=True, scale=5)
+            else:
+                warnings.warn(
+                    "export_path is ignored with display_type='interactive' outside of jupyter. "
+                    "to save the figure, use display_type='matplotlib' or 'pyvista'."
+                )
         return plotter.show(jupyter_backend='trame')
 
     # pyvista mode: returns static jupyter widget (legacy behavior)
@@ -327,10 +343,3 @@ def finalize_plot(plotter, export_path, display_type, ax=None, cbar_info=None, c
     elif display_type == 'object':
         # user handles rendering/saving themselves
         return plotter
-
-    # fallback: cleanup and return nothing
-    else:
-        if export_path:
-            plotter.screenshot(export_path, transparent_background=True, scale=5)
-        plotter.close()
-        return None
