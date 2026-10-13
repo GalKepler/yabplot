@@ -23,3 +23,7 @@
 ::: yabplot.plotting.plot_connectome
     options:
         show_root_heading: true
+
+::: yabplot.plotting.clear_cache
+    options:
+        show_root_heading: true
