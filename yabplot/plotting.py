@@ -123,7 +123,7 @@ def _render_cortical_views(lh_v, lh_f, lh_vals, rh_v, rh_f, rh_vals, is_cat,
 
 
 def get_base_name(name):
-    """Strip hemisphere suffix to get the base region name."""
+    """Strip one hemisphere suffix or prefix to get the base region name."""
     n = name.lower()
     for suffix in ['_l', '_r', '-lh', '-rh']:
         if n.endswith(suffix):
@@ -367,8 +367,8 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
     cmap : str or matplotlib.colors.Colormap, optional
         Colormap for continuous data. Defaults to 'coolwarm' when `data` is given.
         If `data` is None (atlas mode), `cmap` is unused by default and regions get
-        randomly-seeded distinct colors; pass a colormap name to instead sample
-        region colors from that colormap's gradient.
+        randomly-seeded distinct colors; pass a colormap (name or object) to instead
+        sample region colors from that colormap's gradient.
     vminmax : list [min, max], optional
         Manual lower and upper bounds for the colormap. If [None, None],
         bounds are inferred from the data range.
@@ -395,6 +395,8 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         'object': returns the raw pyvista plotter object.
     export_path : str, optional
         If provided, saves the final figure to this path (e.g., 'figure.png').
+        With `plot_regions_separately`, it is instead the directory that the
+        per-region PNGs are saved to.
     custom_atlas_proc : dict, optional
         Parameters for processing custom GIfTI files.
         Keys: 'smooth_i' (iterations) and 'smooth_f' (relaxation factor).
@@ -407,13 +409,23 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         `data` is given. Default is 42.
     plot_regions_separately : bool, optional
         If True, renders each region + view combination on its own instead of a single
-        combined figure. If ``export_path`` is set, one transparent-background PNG per
-        region is saved there (named ``{region}_{view_face}.png``, useful for SVG
-        tracing pipelines) and None is returned; otherwise the per-region axes are
-        displayed and returned as a list. Default is False.
+        combined figure. If ``export_path`` is set, it is always treated as a directory
+        (created if missing): one transparent-background PNG per region + view is saved
+        there (named ``{region}_{view_face}.png``, useful for SVG tracing pipelines)
+        and None is returned. ``view_face`` is the view name without ``left_``/``right_``;
+        midline regions keep the full view name. Otherwise one matplotlib figure per
+        region + view is opened and the axes are returned as a list.
+        All renders share the same camera framing, so regions keep their relative
+        position and size, and the same size: `figsize` if given, else 3.5 x 3 inches.
+        `ax`, `layout`, `display_type` and `cbar_kwargs` are not used in this mode and
+        no colorbar is drawn. Default is False.
     shared_hemisphere_colors : bool, optional
         If True, bilateral region pairs (e.g. ``putamen_l`` / ``putamen_r``) are drawn
         in the same color, so each structure reads as one color across both hemispheres.
+        Pairs are matched by name after removing one hemisphere tag (case-insensitive):
+        a ``_l``/``_r`` or ``-lh``/``-rh`` suffix, or a ``l-``/``r-``, ``l_``/``r_``,
+        ``left_``/``right_`` or ``left-``/``right-`` prefix. Regions named in any other
+        way keep their own color.
         Only applies in atlas (no-data) mode; ignored when `data` is given. If False
         (default), every region is assigned its own independent color.
 
@@ -425,6 +437,8 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         - 'interactive': returns a trame browser viewer.
         - 'pyvista': returns a static jupyter widget.
         - 'object': returns the raw pyvista plotter.
+        with `plot_regions_separately`, returns None if `export_path` is set,
+        otherwise a list of matplotlib axes (one per region + view).
     """
 
     # defaults
@@ -482,23 +496,21 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
 
     # setup views and shading (shared by both code paths)
     sel_views = get_view_configs(views)
-    ax, display_type, figsize = prepare_plotter(ax, display_type, sel_views, layout, figsize)
 
     # get shading parameters from style
     shading_params = get_shading_preset(style)
 
     if plot_regions_separately:
-        # per-region output
+        # per-region output; export_path is always a directory here
         do_export = export_path is not None
         if do_export:
-            _, _ext = os.path.splitext(export_path)
-            out_dir = os.path.dirname(export_path) if _ext else export_path
-            if not out_dir:
-                out_dir = os.getcwd()
+            out_dir = export_path
             os.makedirs(out_dir, exist_ok=True)
 
-        # figsize can be None for non-matplotlib display types; fall back to default
-        region_window_size = list(figsize) if figsize is not None else [1000, 800]
+        # every render has the same size. 'object' makes prepare_plotter only convert
+        # figsize to pixels, so no figure is created for the unused combined layout
+        _, _, region_size = prepare_plotter(None, 'object', sel_views, layout, figsize)
+        region_window_size = list(region_size) if region_size is not None else [700, 600]
         region_axes = []
 
         for view_name, cfg in sel_views.items():
@@ -521,6 +533,7 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
                 add_context_to_view(indiv_plotter, ctx_meshes, cfg['side'], bmesh_alpha,
                                     bmesh_color, **shading_params)
 
+                region_actors = {}
                 for name, mesh in meshes.items():
                     n_is_left, n_is_right = _get_side_tokens(name)
                     if cfg['side'] == 'L' and n_is_right and not n_is_left:
@@ -541,10 +554,13 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
                     else:
                         props.update({'color': d_atlas_colors[name], 'opacity': 1.0})
 
-                    actor = indiv_plotter.add_mesh(mesh, **props)
-                    actor.SetVisibility(name == target_name)
+                    region_actors[name] = indiv_plotter.add_mesh(mesh, **props)
 
+                # frame the camera on all regions before hiding the non-targets, so each
+                # region keeps its true position and size (hidden actors are not framed)
                 set_camera(indiv_plotter, cfg, zoom=zoom)
+                for name, actor in region_actors.items():
+                    actor.SetVisibility(name == target_name)
                 indiv_plotter.hide_axes()
 
                 if do_export:
@@ -564,6 +580,7 @@ def plot_subcortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cba
         return None if do_export else region_axes
 
     # setup plotter (combined / normal path)
+    ax, display_type, figsize = prepare_plotter(ax, display_type, sel_views, layout, figsize)
     needs_bottom = (data is not None)
     plotter, ncols, nrows = setup_plotter(sel_views, layout, figsize, display_type,
                                           needs_bottom_row=needs_bottom)
