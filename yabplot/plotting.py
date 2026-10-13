@@ -228,7 +228,7 @@ def plot_cortical(data=None, atlas=None, custom_atlas_path=None, ax=None, cbar_k
 
 def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=None, layout=None, figsize=None,
                     cmap='coolwarm', vminmax=[None, None], nan_color=(1.0, 1.0, 1.0), style='default', zoom=1.2,
-                    display_type='matplotlib', export_path=None):
+                    display_type='matplotlib', export_path=None, lut=None, proc_vertices='sharp'):
     """
     Visualize arbitrary per-vertex scalar data on a user-supplied brain mesh.
 
@@ -269,6 +269,17 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
         'object': returns the raw pyvista plotter object.
     export_path : str, optional
         If provided, saves the figure to this path.
+    lut : list, numpy.ndarray or 'auto', optional
+        Lookup table for categorical data (e.g., labels or clusters), where ``lut[i]``
+        is the color of label ``i``. Label 0 is treated as background and drawn with
+        `nan_color`, so ``lut[0]`` is not used. If 'auto', a distinct color is generated
+        for each label. When provided, `cmap` and `vminmax` are ignored and no colorbar
+        is drawn. Default is None (data is treated as continuous).
+    proc_vertices : str or None, optional
+        Whether to process the vertices edges between labels. Only used when `lut` is
+        provided (continuous data is always plotted as is).
+        Set to None to not perform.
+        'sharp': Applies sharpening of the resolution of different color vertices (default).
 
     Returns
     -------
@@ -297,6 +308,9 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
     >>> lh['thickness'] = lh_thick_array
     >>> rh['thickness'] = rh_thick_array
     >>> plot_vertexwise(lh, rh, scalars='thickness', cmap='inferno')
+    >>>
+    >>> # If your data are labels (e.g., clusters 1 and 2), color label i with lut[i]
+    >>> plot_vertexwise(lh, rh, scalars='clusters', lut=['white', 'red', 'blue'])
     """
 
     # extract v, f, raw from PyVista meshes
@@ -305,11 +319,34 @@ def plot_vertexwise(lh, rh, scalars='Data', ax=None, cbar_kwargs=None, views=Non
     rh_v, rh_f = extract_polydata(rh)
     rh_vals_raw = rh[scalars]
 
+    # categorical mode is opt-in: label i is colored with lut[i]
+    is_cat = lut is not None
+    max_id = None
+    if is_cat:
+        # labels must be whole numbers (NaN is allowed and treated as background)
+        labels = np.concatenate([lh_vals_raw, rh_vals_raw])
+        labels = labels[~np.isnan(labels)]
+        if not np.all(labels == np.round(labels)):
+            raise ValueError("lut requires whole-number labels (e.g., 0, 1, 2) but data contains other values.")
+        max_label = int(labels.max()) if labels.size else 0
+        if isinstance(lut, str) and lut == 'auto':
+            lut = generate_distinct_colors(max_label + 1, seed=42)
+        if max_label >= len(lut):
+            raise ValueError(f"lut has {len(lut)} colors but data contains label {max_label}.")
+        # color range must span the whole lut (not the data) to keep label i on lut[i]
+        max_id = len(lut) - 1
+        # 'blur' mixes neighbouring label ids, which would draw wrong labels on the edges
+        if proc_vertices not in ('sharp', None):
+            raise ValueError("proc_vertices must be 'sharp' or None.")
+    else:
+        # edge processing works per label, so continuous data is plotted as is
+        proc_vertices = None
+
     # render
     return _render_cortical_views(
-        lh_v, lh_f, lh_vals_raw, rh_v, rh_f, rh_vals_raw, False, ax, cbar_kwargs,
+        lh_v, lh_f, lh_vals_raw, rh_v, rh_f, rh_vals_raw, is_cat, ax, cbar_kwargs,
         views, layout, figsize, cmap, vminmax, nan_color, style,
-        zoom, None, display_type, export_path
+        zoom, proc_vertices, display_type, export_path, lut_colors=lut, max_id=max_id
     )
 
 
