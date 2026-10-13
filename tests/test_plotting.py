@@ -73,8 +73,9 @@ def _label_colors(plotter, labels):
     plotter.close()
     return colors
 
+@pytest.mark.parametrize("proc_vertices", ['sharp', None])
 @pytest.mark.parametrize("dtype", [int, float])
-def test_plot_vertexwise_lut(dtype):
+def test_plot_vertexwise_lut(dtype, proc_vertices):
     """Verify that label i is colored with lut[i], also when the lut has unused entries."""
     lut = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (0, 1, 1)]
     lh = pv.Sphere()
@@ -82,7 +83,8 @@ def test_plot_vertexwise_lut(dtype):
     # only labels 1-3 are present while the lut goes up to 5
     lh['Data'] = np.resize([1, 2, 3], lh.n_points).astype(dtype)
     rh['Data'] = np.resize([1, 2, 3], rh.n_points).astype(dtype)
-    plotter = yab.plot_vertexwise(lh, rh, lut=lut, views=['left_lateral'], display_type='object')
+    plotter = yab.plot_vertexwise(lh, rh, lut=lut, proc_vertices=proc_vertices,
+                                  views=['left_lateral'], display_type='object')
     colors = _label_colors(plotter, [1, 2, 3])
     for label in [1, 2, 3]:
         assert np.allclose(colors[label], lut[label])
