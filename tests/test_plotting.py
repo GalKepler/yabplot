@@ -61,6 +61,43 @@ def test_plot_vertexwise():
     rh['Data'] = np.random.rand(rh.n_points)
     yab.plot_vertexwise(lh, rh, display_type='matplotlib')
 
+def _label_colors(plotter, labels):
+    """Return the RGB color each label value is drawn with in the first view."""
+    actor = next(a for a in plotter.renderers[0].actors.values() if getattr(a, 'mapper', None) is not None)
+    table = actor.mapper.GetLookupTable()
+    colors = {}
+    for label in labels:
+        rgb = [0.0, 0.0, 0.0]
+        table.GetColor(float(label), rgb)
+        colors[label] = rgb
+    plotter.close()
+    return colors
+
+@pytest.mark.parametrize("dtype", [int, float])
+def test_plot_vertexwise_lut(dtype):
+    """Verify that label i is colored with lut[i], also when the lut has unused entries."""
+    lut = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (0, 1, 1)]
+    lh = pv.Sphere()
+    rh = pv.Sphere()
+    # only labels 1-3 are present while the lut goes up to 5
+    lh['Data'] = np.resize([1, 2, 3], lh.n_points).astype(dtype)
+    rh['Data'] = np.resize([1, 2, 3], rh.n_points).astype(dtype)
+    plotter = yab.plot_vertexwise(lh, rh, lut=lut, views=['left_lateral'], display_type='object')
+    colors = _label_colors(plotter, [1, 2, 3])
+    for label in [1, 2, 3]:
+        assert np.allclose(colors[label], lut[label])
+
+def test_plot_vertexwise_integer_data_stays_continuous():
+    """Verify that integer data without a lut is still drawn with the colormap."""
+    lh = pv.Sphere()
+    rh = pv.Sphere()
+    lh['Data'] = np.resize([0, 1], lh.n_points)
+    rh['Data'] = np.resize([0, 1], rh.n_points)
+    plotter = yab.plot_vertexwise(lh, rh, cmap='Reds', views=['left_lateral'], display_type='object')
+    colors = _label_colors(plotter, [0, 1])
+    assert np.allclose(colors[0], plt.get_cmap('Reds')(0.0)[:3], atol=0.01)
+    assert np.allclose(colors[1], plt.get_cmap('Reds')(1.0)[:3], atol=0.01)
+
 def test_plot_voxelwise(synthetic_nifti):
     """Smoke test: verify that plot_voxelwise renders with synthetic volume."""
     yab.plot_voxelwise(synthetic_nifti, threshold=5.0, blur_sigma=0, display_type='matplotlib')
